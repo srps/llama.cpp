@@ -1,0 +1,111 @@
+name: Dory fork validation
+
+on:
+  push:
+    branches: [dory-scale-placement-ci-20261020]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dory-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    if: github.repository == 'srps/llama.cpp'
+    name: CPU (${{ matrix.os }}, ${{ matrix.mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            mode: Release
+            extra: ''
+          - os: ubuntu-24.04
+            mode: Debug
+            extra: '-DLLAMA_SANITIZE_ADDRESS=ON -DLLAMA_SANITIZE_UNDEFINED=ON'
+          - os: windows-2022
+            mode: Release
+            extra: ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    env:
+      GGML_N_THREADS: 1
+      GGML_SCHED_DEBUG_REALLOC: 1
+      ASAN_OPTIONS: detect_leaks=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v6
+      - name: Record scope
+        run: |
+          mkdir -p logs
+          git rev-parse HEAD | tee logs/commit.txt
+          echo 'CPU tests cover BF16 loading, 19 scales, and mixed-batch inference. GPU placement regression requires a GPU run.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.mode }} \
+            -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF ${{ matrix.extra }} 2>&1 | tee logs/configure.txt
+      - name: Build test targets
+        run: |
+          cmake --build build --config ${{ matrix.mode }} --parallel 2 \
+            --target test-llama-archs test-gguf test-quantize-fns test-backend-ops 2>&1 | tee logs/build.txt
+      - name: Registered CPU fixture, GGUF and quantization tests
+        run: |
+          ctest --test-dir build -C ${{ matrix.mode }} --output-on-failure --verbose \
+            --no-tests=error --timeout 300 -R '^(test-llama-archs-dory|test-gguf|test-quantize-fns)$' 2>&1 | tee logs/ctest.txt
+      - name: All Dory CPU configurations and F32 cast operations
+        run: |
+          bindir=build/bin
+          if [[ "$RUNNER_OS" == Windows ]]; then bindir=build/bin/${{ matrix.mode }}; fi
+          "$bindir/test-llama-archs" -a dory -b CPU -s 1 2>&1 | tee logs/dory-cpu.txt
+          "$bindir/test-backend-ops" -b CPU -o CPY -p 'type_src=(f32|f16|bf16),type_dst=f32' 2>&1 | tee logs/cpy-cpu.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dory-${{ matrix.os }}-${{ matrix.mode }}
+          path: logs/
+
+  cuda-compile:
+    if: github.repository == 'srps/llama.cpp'
+    name: CUDA 12.6 compile (no GPU execution)
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake build-essential ninja-build libgomp1 git libssl-dev
+      - name: Configure with upstream CUDA job settings
+        run: |
+          mkdir -p logs
+          git rev-parse HEAD | tee logs/commit.txt
+          cmake -S . -B build -G Ninja \
+            -DLLAMA_FATAL_WARNINGS=ON -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=89-real \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+            -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3 \
+            -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF 2>&1 | tee logs/configure.txt
+      - name: Compile CUDA backend and regression test
+        run: |
+          cmake --build build --parallel 2 --target test-llama-archs test-backend-ops 2>&1 | tee logs/build.txt
+          echo 'CUDA compile check only: this hosted runner has no NVIDIA GPU. Numerical and placement evidence comes from the separately recorded local RTX 5070 Ti runs.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dory-cuda-compile
+          path: logs/
