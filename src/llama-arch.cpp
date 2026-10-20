@@ -1288,6 +1288,7 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
 
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
+        case LLM_ARCH_DORY:
         case LLM_ARCH_GROK:
         case LLM_ARCH_MPT:
         case LLM_ARCH_PLAMO2:
