@@ -2,7 +2,7 @@ name: Dory fork validation
 
 on:
     push:
-        branches: [dory-scale-placement-ci-20261020]
+        branches: [dory-scale-placement-ci-20261020, dory-physical-layer-placement-20261020]
     workflow_dispatch:
 
 permissions:
@@ -45,7 +45,7 @@ jobs:
                 run: |
                     mkdir -p logs
                     git rev-parse HEAD | tee logs/commit.txt
-                    echo 'CPU tests cover BF16 loading, 19 scales, and mixed-batch inference. GPU placement regression requires a GPU run.' >> "$GITHUB_STEP_SUMMARY"
+                    echo 'CPU tests cover BF16 loading, 19 scales, virtual-layer index/cache-count checks, and mixed-batch inference. Device placement requires a GPU run.' >> "$GITHUB_STEP_SUMMARY"
             -   name: Configure
                 run: |
                     cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.mode }} \
@@ -58,8 +58,8 @@ jobs:
                         --target test-llama-archs test-gguf test-quantize-fns test-backend-ops 2>&1 | tee logs/build.txt
             -   name: Registered CPU fixture, GGUF and quantization tests
                 run: |
-                    tests='^(test-llama-archs-dory|test-gguf|test-quantize-fns)$'
-                    if [[ '${{ matrix.mode }}' == Debug ]]; then tests='^(test-llama-archs-dory|test-quantize-fns)$'; fi
+                    tests='^(test-llama-archs-dory(-partial)?|test-gguf|test-quantize-fns)$'
+                    if [[ '${{ matrix.mode }}' == Debug ]]; then tests='^(test-llama-archs-dory(-partial)?|test-quantize-fns)$'; fi
                     ctest --test-dir build -C ${{ matrix.mode }} --output-on-failure --verbose \
                         --no-tests=error --timeout 300 -R "$tests" 2>&1 | tee logs/ctest.txt
             -   name: GGUF and CPY under ASan (test case enums fail UBSan)

@@ -16,6 +16,10 @@ Local validation of the same four source files on one RTX 5070 Ti passed 126 Dor
 
 Claude Opus 5.5 reviewed the final source and recorded no blockers. It identified a remaining hypothetical test limitation for backends whose operation-support checks depend on the source's existing buffer; CUDA's placement negative control does fail as intended. Dory model-save round trips remain unsupported and are skipped by the existing test harness.
 
-The separate Dory partial-offload issue remains open: with two loops, `-ngl 4` and `-ngl 40` assigned 0/72 physical repeating layers to CUDA, while `-ngl 999` assigned 72/72. Only the output head was offloaded at the smaller settings. This branch does not implement partial-offload or tensor-parallel mapping.
+The original scale-placement branch left a separate partial-offload issue open: at two loops, `-ngl 4` and `-ngl 40` assigned 0/72 physical repeating layers to CUDA. The physical-layer follow-up corrects the offload budget, device table, virtual cache ownership, full-offload checks, and automatic fit accounting. It preserves the public virtual layer count and leaves tensor-parallel Dory unsupported.
+
+The follow-up passes 110 local CPU/CUDA fixture cases and adds default partial BF16 cases for both cache modes. The CPU path checks physical/virtual index arithmetic; the GPU path checks actual weight and K-cache storage. Deliberate wrong-threshold and wrong-count mutations fail the default GPU and CPU runs respectively; restoring the source passes. The official checkpoint passes 18 placement/decode cases, automatic partial fitting, and 2/3 logical-device splits on one physical GPU. Real multi-GPU behavior remains untested. Hosted CI on this follow-up is separate from the original branch's completed run.
+
+At `-ngl 40`, interleaved local measurements improved from 7.11 to 14.81 tokens/s. Full-offload measurements were 86.07 before and 85.50 after; three full-GPU prompts had identical generated tokens and reported probabilities. The quantized checkpoint's CPU/GPU logit differences are recorded separately and are not an accuracy validation.
 
 AI assistance: Codex implemented and tested these changes under the owner's direction; Claude Opus 5.5 provided independent read-only review.
