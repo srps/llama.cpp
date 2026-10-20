@@ -62,7 +62,7 @@ jobs:
                     if [[ '${{ matrix.mode }}' == Debug ]]; then tests='^(test-llama-archs-dory|test-quantize-fns)$'; fi
                     ctest --test-dir build -C ${{ matrix.mode }} --output-on-failure --verbose \
                         --no-tests=error --timeout 300 -R "$tests" 2>&1 | tee logs/ctest.txt
-            -   name: GGUF under ASan (its invalid-enum sentinel fails UBSan)
+            -   name: GGUF and CPY under ASan (test case enums fail UBSan)
                 if: matrix.mode == 'Debug'
                 run: |
                     cmake -S . -B build-gguf-asan -DCMAKE_BUILD_TYPE=Debug \
@@ -70,16 +70,19 @@ jobs:
                         -DLLAMA_SANITIZE_ADDRESS=ON -DLLAMA_SANITIZE_UNDEFINED=OFF \
                         -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
                         -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF 2>&1 | tee logs/gguf-asan-configure.txt
-                    cmake --build build-gguf-asan --parallel 2 --target test-gguf 2>&1 | tee logs/gguf-asan-build.txt
+                    cmake --build build-gguf-asan --parallel 2 --target test-gguf test-backend-ops 2>&1 | tee logs/gguf-asan-build.txt
                     ctest --test-dir build-gguf-asan --output-on-failure --verbose \
                         --no-tests=error --timeout 300 -R '^test-gguf$' 2>&1 | tee logs/gguf-asan-test.txt
-                    echo 'GGUF runs with ASan only: unchanged tests/test-gguf.cpp:160 constructs gguf_type(-1), which stops UBSan enum checks. Dory and cast tests retain ASan+UBSan.' >> "$GITHUB_STEP_SUMMARY"
+                    build-gguf-asan/bin/test-backend-ops -b CPU -o CPY -p 'type_src=(f32|f16|bf16),type_dst=f32' 2>&1 | tee logs/cpy-asan.txt
+                    echo 'GGUF and CPY run with ASan only: unchanged test case generation uses out-of-range gguf_type and ggml_scale_mode values, which stop UBSan enum checks before CPY filtering. Dory and quantization retain ASan+UBSan.' >> "$GITHUB_STEP_SUMMARY"
             -   name: All Dory CPU configurations and F32 cast operations
                 run: |
                     bindir=build/bin
                     if [[ "$RUNNER_OS" == Windows ]]; then bindir=build/bin/${{ matrix.mode }}; fi
                     "$bindir/test-llama-archs" -a dory -b CPU -s 1 2>&1 | tee logs/dory-cpu.txt
-                    "$bindir/test-backend-ops" -b CPU -o CPY -p 'type_src=(f32|f16|bf16),type_dst=f32' 2>&1 | tee logs/cpy-cpu.txt
+                    if [[ '${{ matrix.mode }}' != Debug ]]; then
+                        "$bindir/test-backend-ops" -b CPU -o CPY -p 'type_src=(f32|f16|bf16),type_dst=f32' 2>&1 | tee logs/cpy-cpu.txt
+                    fi
             -   uses: actions/upload-artifact@v4
                 if: always()
                 with:
