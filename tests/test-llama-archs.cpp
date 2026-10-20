@@ -9,10 +9,14 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-kv-cache-iswa.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -98,6 +102,7 @@ static void usage(char ** argv) {
     LOG("Options:\n");
     LOG("  -a, --arch <arch|regex>  Run only matching LLM architectures (default: all supported)\n");
     LOG("  --config <name>         Run only the named configuration\n");
+    LOG("  --gpu-layers <N>        Set the number of offloaded weight layers (default: all)\n");
     LOG("  -s, --seed <seed>        Set the random seed for tensor initialization and token generation\n");
     LOG("  -d, --stdev <stdev>      Set the standard deviation of the tensor initialization distribution (default: 0.1f)\n");
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
@@ -535,7 +540,72 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
-static bool check_dory_scale_placement(const llama_model * model, ggml_backend_dev_t dev) {
+static ggml_backend_dev_t dory_fixture_device(ggml_backend_dev_t dev, int physical_layer, int gpu_layers) {
+    // The fixture has six physical blocks and a separate output head.
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+            (gpu_layers >= 0 && physical_layer < std::max(7 - gpu_layers, 0))) {
+        return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    return dev;
+}
+
+static bool tensor_on_device(const ggml_tensor * tensor, ggml_backend_dev_t dev) {
+    const auto buft = ggml_backend_buffer_get_type(tensor->buffer);
+    const bool ok = buft == ggml_backend_dev_buffer_type(dev) ||
+        (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_buft_is_host(buft));
+    if (!ok) {
+        LOG_ERR("%s: %s uses %s instead of %s\n", __func__, tensor->name,
+                ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
+    }
+    return ok;
+}
+
+static bool check_dory_layer_placement(const llama_model * model, llama_context * lctx,
+        ggml_backend_dev_t dev, int num_loops, bool shared_kv, int gpu_layers) {
+    bool ok = llama_model_n_layer_weight(model) == 6 &&
+        llama_model_n_layer(model) == 4 + 2*num_loops &&
+        model->n_gpu_layers() == uint32_t(gpu_layers < 0 ? 7 : gpu_layers);
+    std::vector<bool> physical_seen(6, false);
+    for (const auto & entry : llama_internal_get_tensor_map(model)) {
+        // Quantizer metadata may intentionally use host buffers.
+        if (entry.first.size() < 7 || entry.first.compare(entry.first.size() - 7, 7, ".weight") != 0) {
+            continue;
+        }
+        int p;
+        if (sscanf(entry.first.c_str(), "blk.%d.", &p) == 1 && p >= 0 && p < 6) {
+            physical_seen[p] = true;
+            ok = tensor_on_device(entry.second, dory_fixture_device(dev, p, gpu_layers)) && ok;
+        } else if (entry.second == model->output) {
+            ok = tensor_on_device(entry.second, dory_fixture_device(dev, 6, gpu_layers)) && ok;
+        }
+    }
+    const auto physical = [num_loops](uint32_t il) {
+        return il < 2 ? il : il < uint32_t(2 + 2*num_loops) ? 2 + (il - 2)%2 : il - 2*(num_loops - 1);
+    };
+    for (uint32_t il = 0; il < uint32_t(4 + 2*num_loops); ++il) {
+        if (model->layer_weight_idx(il) != physical(il) ||
+                model->dev_layer(il) != dory_fixture_device(dev, physical(il), gpu_layers)) {
+            LOG_ERR("%s: virtual layer %u has wrong device\n", __func__, il);
+            ok = false;
+        }
+    }
+    auto * memory = dynamic_cast<llama_kv_cache_iswa *>(llama_get_memory(lctx));
+    if (!memory) {
+        LOG_ERR("%s: expected an ISWA cache\n", __func__);
+        return false;
+    }
+    size_t n_caches = 0;
+    for (auto * cache : {memory->get_base(), memory->get_swa()}) {
+        for (uint32_t il : cache->get_layer_ids()) {
+            n_caches++;
+            ok = tensor_on_device(cache->get_k_storage(il), dory_fixture_device(dev, physical(il), gpu_layers)) && ok;
+        }
+    }
+    return ok && std::all_of(physical_seen.begin(), physical_seen.end(), [](bool seen) { return seen; }) &&
+        n_caches == size_t(shared_kv ? 3 : num_loops + 2);
+}
+
+static bool check_dory_scale_placement(const llama_model * model, ggml_backend_dev_t dev, int gpu_layers) {
     ggml_init_params params = { ggml_tensor_overhead()*3, nullptr, true };
     ggml_context_ptr ctx(ggml_init(params));
     GGML_ASSERT(ctx);
@@ -547,13 +617,11 @@ static bool check_dory_scale_placement(const llama_model * model, ggml_backend_d
             continue;
         }
         n_scales++;
+        int p = 6;
+        sscanf(tensor->name, "blk.%d.", &p);
+        const auto expected = dory_fixture_device(dev, p, gpu_layers);
         ggml_tensor * cast = ggml_cast(ctx.get(), entry.second, GGML_TYPE_F32);
-        const auto buft = ggml_backend_buffer_get_type(tensor->buffer);
-        const bool on_device = buft == ggml_backend_dev_buffer_type(dev) ||
-            (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_buft_is_host(buft));
-        if (ggml_backend_dev_supports_op(dev, cast) && !on_device) {
-            LOG_ERR("%s: %s uses %s instead of %s\n", __func__, tensor->name,
-                    ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
+        if (ggml_backend_dev_supports_op(expected, cast) && !tensor_on_device(tensor, expected)) {
             ok = false;
         }
         ggml_reset(ctx.get());
@@ -565,7 +633,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        int gpu_layers = -1) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -574,6 +643,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
+    model_params.n_gpu_layers = gpu_layers;
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -910,7 +980,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
     return 0;
 }
 
-static int test_backends(const std::string & arch_filter, const std::string & config_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
+static int test_backends(const std::string & arch_filter, const std::string & config_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend, int gpu_layers) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -1036,9 +1106,12 @@ static int test_backends(const std::string & arch_filter, const std::string & co
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
-        for (int config = 0; config < (arch == LLM_ARCH_DORY ? 9 : 2); ++config) {
-            const bool bf16_scales = arch == LLM_ARCH_DORY && config == 8;
-            const bool shared_kv = arch == LLM_ARCH_DORY && config >= 4 && config < 8;
+        for (int config = 0; config < (arch == LLM_ARCH_DORY ? 11 : 2); ++config) {
+            const bool partial_offload = arch == LLM_ARCH_DORY && config >= 9;
+            const bool bf16_scales = arch == LLM_ARCH_DORY && config >= 8;
+            const bool shared_kv = arch == LLM_ARCH_DORY && ((config >= 4 && config < 8) || config == 10);
+            // Default GPU runs must also exercise physical weight placement at partial offload.
+            const int config_gpu_layers = partial_offload && gpu_layers == -1 ? 4 : gpu_layers;
             const bool moe = arch != LLM_ARCH_DORY && config != 0;
             if (moe && !moe_implemented(arch)) {
                 continue;
@@ -1047,7 +1120,7 @@ static int test_backends(const std::string & arch_filter, const std::string & co
                 continue;
             }
             const int num_loops = bf16_scales ? 2 : config % 4 + 1;
-            const std::string config_name = arch == LLM_ARCH_DORY ? "K" + std::to_string(num_loops) + (shared_kv ? "/L" : "/P") + (bf16_scales ? "/BF16" : "") : moe ? "MoE" : "Dense";
+            const std::string config_name = arch == LLM_ARCH_DORY ? "K" + std::to_string(num_loops) + (shared_kv ? "/L" : "/P") + (bf16_scales ? "/BF16" : "") + (partial_offload ? "/partial" : "") : moe ? "MoE" : "Dense";
             if (!config_filter.empty() && config_filter != config_name) {
                 continue;
             }
@@ -1093,7 +1166,7 @@ static int test_backends(const std::string & arch_filter, const std::string & co
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, config_gpu_layers);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -1103,9 +1176,15 @@ static int test_backends(const std::string & arch_filter, const std::string & co
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
                         if (bf16_scales && dc.split_mode == LLAMA_SPLIT_MODE_LAYER && dc.devs.size() == 1 &&
-                                !check_dory_scale_placement(model_and_ctx_dev.first.get(), dc.devs.front())) {
+                                !check_dory_scale_placement(model_and_ctx_dev.first.get(), dc.devs.front(), config_gpu_layers)) {
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m (placement)";
+                        }
+                        if (arch == LLM_ARCH_DORY && dc.split_mode == LLAMA_SPLIT_MODE_LAYER && dc.devs.size() == 1 &&
+                                !check_dory_layer_placement(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(),
+                                    dc.devs.front(), num_loops, shared_kv, config_gpu_layers)) {
+                            test_ok = false;
+                            status_nmse = "\033[1;31mFAIL\033[0m (layer placement)";
                         }
 
                         // chunked decode matches a single batch only with causal attention over a memory
@@ -1219,6 +1298,7 @@ int main(int argc, char ** argv) {
 
     std::string arch_filter;
     std::string config_filter;
+    int gpu_layers = -1;
     size_t seed = rd();
     float stdev = 0.1f;
     std::string out;
@@ -1252,6 +1332,13 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--seed") == 0) {
             if (i + 1 < argc) {
                 seed = std::stoull(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--gpu-layers") == 0) {
+            if (i + 1 < argc) {
+                gpu_layers = std::stoi(argv[++i]);
             } else {
                 usage(argv);
                 return 1;
@@ -1311,12 +1398,12 @@ int main(int argc, char ** argv) {
 
     try {
         if (!out.empty()) {
-            if (!config_filter.empty()) {
-                throw std::runtime_error("--config cannot be used with --out");
+            if (!config_filter.empty() || gpu_layers != -1) {
+                throw std::runtime_error("--config and --gpu-layers cannot be used with --out");
             }
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        return test_backends(arch_filter, config_filter, seed, stdev, verbosity, target_backend);
+        return test_backends(arch_filter, config_filter, seed, stdev, verbosity, target_backend, gpu_layers);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

@@ -226,6 +226,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
     llama_test(test-llama-archs NAME test-llama-archs-dory ARGS -a dory --config K2/P/BF16 -b CPU -s 1)
+    llama_test(test-llama-archs NAME test-llama-archs-dory-partial ARGS -a dory --gpu-layers 4 -b CPU -s 1)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
